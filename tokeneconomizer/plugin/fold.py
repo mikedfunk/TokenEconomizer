@@ -19,15 +19,19 @@ Each session is folded once, at its first end, keyed by session id; a resumed se
 re-folded, because counting the same trajectory twice would hand the fact lifecycle confirmations
 it did not earn.
 """
+import dataclasses
+import glob
+import json
 import os
 import shutil
 import tempfile
 import time
 
 from .. import trace
-from . import accounting, denylist, sidecall
+from . import accounting, denylist, paths, sidecall
 from . import adapter as live_adapter
 from .adapter import LiveAdapter, load_catalog
+from .store import Store
 
 STALE_S = 600           # an unfolded session whose transcript is quiet this long is over
 # A fold never runs in a hook -- it is a detached process, or `te fold` -- so it can wait for
@@ -459,3 +463,74 @@ def spawn_fold(ctx, session_ids):
         return [fold_session(ctx, sid) for sid in session_ids]
     return ctx.spawn(["fold"] + [a for sid in session_ids for a in ("--session", sid)],
                      "fold.log")
+
+
+BACKFILL_DOC = "backfill.json"      # in the state root: written when the history run is started
+
+
+def claude_history(env):
+    """(mtime, session id, transcript, cwd) for each Claude Code session log on disk, oldest
+    first. A log names its directory in the entries that carry a `cwd`; one with none is skipped.
+    Subagent logs sit below their session's folder, so the one-level glob leaves them out (a
+    session's fold counts them itself)."""
+    home = env.get("CLAUDE_CONFIG_DIR") or os.path.join(paths.home_dir(env), ".claude")
+    out = []
+    for path in glob.glob(os.path.join(home, "projects", "*", "*.jsonl")):
+        cwd = _first_cwd(path)
+        if cwd:
+            out.append((os.path.getmtime(path), os.path.basename(path)[:-6], path, cwd))
+    return sorted(out)
+
+
+def _first_cwd(path, scan=200):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for _, line in zip(range(scan), fh):
+                try:
+                    cwd = json.loads(line).get("cwd")
+                except (ValueError, AttributeError):
+                    continue
+                if cwd:
+                    return cwd
+    except OSError:
+        pass
+    return None
+
+
+def backfill(env):
+    """Fold the sessions Claude Code kept before the plugin was installed, oldest first, each
+    into the repository it ran in -- the same `fold_session` a live session gets, so the
+    history teaches what the following sessions would have. Returns {folded, skipped}.
+
+    Free layer only: the paid proposer would be called once per `microskills_propose_every`
+    sessions of the whole history. A session whose checkout is gone, or whose log is still being
+    written, is skipped. Safe to run again: a folded session is never counted twice."""
+    from . import hosts
+    from .context import LiveContext
+    host, ctxs, count, now = hosts.ClaudeCode(), {}, {"folded": 0, "skipped": 0}, time.time()
+    for mtime, sid, path, cwd in claude_history(env):
+        if now - mtime < STALE_S or not os.path.isdir(cwd):
+            count["skipped"] += 1
+            continue
+        if cwd not in ctxs:
+            ctx = LiveContext.build(host, cwd, env, settle=False)
+            if "distiller" in ctx.config.microskills:
+                ctx.config = dataclasses.replace(ctx.config, microskills="envfacts")
+            ctxs[cwd] = ctx
+        ctx = ctxs[cwd]
+        if not ctx.config.enabled:
+            count["skipped"] += 1
+        elif fold_session(ctx, sid, path):
+            count["folded"] += 1
+    return count
+
+
+def spawn_backfill(ctx):
+    """The first Claude Code session start after install: learn from the history, detached, once
+    (`te backfill` runs it again). Not under TE_FOLD_SYNC=1, which tests set: they must not
+    read the real `~/.claude`."""
+    state = Store(ctx.root)
+    if ctx.host.name != "claude" or ctx.env.get("TE_FOLD_SYNC") == "1" or state.read(BACKFILL_DOC):
+        return
+    state.write(BACKFILL_DOC, {"started": time.time()})
+    ctx.spawn(["backfill"], "fold.log")

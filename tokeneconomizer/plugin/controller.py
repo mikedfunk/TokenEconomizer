@@ -171,6 +171,7 @@ class LiveController:
         repos.prune_pins(self.ctx.root, self.host.name)
         repos.start_migration(self.ctx)
         fold.spawn_fold(self.ctx, fold.pending_sessions(self.ctx, exclude=(self.sid,)))
+        fold.spawn_backfill(self.ctx)
         return merge_outputs(*outputs)
 
     def _toolprune_notices(self, seen):

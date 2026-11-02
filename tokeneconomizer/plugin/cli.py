@@ -518,6 +518,14 @@ def cmd_fold(args):
     return 0
 
 
+def cmd_backfill(args):
+    count = fold.backfill(os.environ)
+    fold.Store(state_root()).write(fold.BACKFILL_DOC, dict(count, done=time.time()))
+    print(f"learned from {count['folded']} earlier Claude Code session(s); "
+          f"{count['skipped']} skipped (checkout gone, still running, or plugin disabled there)")
+    return 0
+
+
 def cmd_judge(args):
     """The detached half of the stuck judge (see plugin/judge.py); not for people."""
     from . import judge
@@ -741,6 +749,7 @@ def build_parser():
     p.add_argument("--session", action="append")
     p.add_argument("--verbose", action="store_true")
     p.set_defaults(fn=cmd_fold)
+    add("backfill").set_defaults(fn=cmd_backfill)
     p = add("judge")
     p.add_argument("--session", required=True)
     p.add_argument("--job", required=True)

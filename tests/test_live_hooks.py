@@ -1508,3 +1508,22 @@ def test_measure_reports_a_failed_probe_in_one_line(env, repo, monkeypatch, caps
     monkeypatch.setattr(toolcheck, "measure", fail)
     assert cli.main(["--host", "claude", "--cwd", repo, "toolprune", "measure", "Workflow"]) == 1
     assert capsys.readouterr().out.strip() == "not measured: `claude -p` exited 1: boom"
+
+
+def test_backfill_learns_from_earlier_claude_sessions_once(env, repo, tmp_path):
+    """Sessions already in `~/.claude` teach the repository they ran in, before the plugin saw
+    any of them; running it again counts none of them twice."""
+    from tokeneconomizer.plugin import fold
+    proj = tmp_path / "claude" / "projects" / "p"
+    proj.mkdir(parents=True)
+    for i in range(4):
+        path = str(proj / f"s{i}.jsonl")
+        trap_session(path, repo, i)
+        body = open(path).read()
+        open(path, "w").write(json.dumps({"type": "attachment", "cwd": repo}) + "\n" + body)
+        os.utime(path, (1_000_000 + i, 1_000_000 + i))
+    env = dict(env, CLAUDE_CONFIG_DIR=str(tmp_path / "claude"))
+    assert fold.backfill(env) == {"folded": 4, "skipped": 0}
+    assert fold.backfill(env) == {"folded": 0, "skipped": 0}
+    assert set(store_for(env, repo).read("folded.json")) == {"s0", "s1", "s2", "s3"}
+    assert "python -m pytest" in store_for(env, repo).read("injection.json")["rendered"]
